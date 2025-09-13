@@ -49,10 +49,34 @@ DEFAULT_CONFIG = {
     "graph_store": {
         "provider": "neo4j",
         "config": {"url": NEO4J_URI, "username": NEO4J_USERNAME, "password": NEO4J_PASSWORD},
+        # Optional Feinsteuerung für Graph-Extraktion
+        "custom_prompt": "Extrahiere ausschließlich stabile, nützliche Entitäten/Beziehungen (Geräte/Rooms/Services/Capabilities); kein Chat‑Meta. Dedupliziere (slugify/lowercase), mappe Selbstreferenzen auf den aktuellen Nutzer, und lege nur Beziehungen für explizit genannte Entitäten an.",
     },
-    "llm": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": "gpt-4o"}},
+    "llm": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": "gpt-4o-mini"}},
     "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": "text-embedding-3-small"}},
     "history_db_path": HISTORY_DB_PATH,
+    # Custom Fact Extraction Prompt (strikt JSON: {"facts": [string,...]})
+    "custom_fact_extraction_prompt": (
+        "Du bist der Memory‑Manager. Extrahiere ausschließlich langlebige, nützliche Informationen aus der Eingabe. "
+        "Keine Floskeln, Entschuldigungen, Selbstbeschreibungen, kein Chat‑Meta und keine Zusammenfassungen. "
+        "Speichere nur, was später nachweislich hilft (z. B. stabile Fakten, klare Vorlieben/Defaults, kanonische Entitäten/IDs, wiederkehrende Routinen). "
+        "Dedupliziere semantisch (nur neue oder präzisere Inhalte). Nutze bei Selbstreferenzen (\"ich\", \"mir\", \"mein\") den aktuellen Nutzer. "
+        "Halte die Sprache der Eingabe bei. Normalisiere Datumsangaben in YYYY‑MM‑DD und nutze kanonische IDs (z. B. light.bedroom). "
+        "Liefere höchstens 5 kurze, präzise Sätze; wenn nichts qualifiziert, gib eine leere Liste zurück. "
+        "Antworte ausschließlich als JSON‑Objekt mit dem Schlüssel facts (Liste von Strings). Keine weitere Ausgabe, keine Codeblöcke. "
+        "Beispiele: Input: Hi -> {\"facts\":[]}; Input: Ich heiße René. -> {\"facts\":[\"Der Nutzer heißt René.\"]}; "
+        "Input: Meine Schlafzimmer‑Lampe heißt light.bedroom. -> {\"facts\":[\"Die Schlafzimmer‑Lampe hat die ID light.bedroom.\"]}"
+    ),
+    # Custom Update Memory Prompt (strikt JSON: {"memory": [{event,text,id?}]})
+    "custom_update_memory_prompt": (
+        "Du entscheidest, wie bestehende Erinnerungen anhand neuer Informationen aktualisiert werden. "
+        "Es gibt vier Ereignisse: ADD (neue Erinnerung), UPDATE (bestehende Erinnerung mit id aktualisieren), DELETE (bestehende Erinnerung mit id löschen), NONE (keine Änderung). "
+        "Aktualisiere nur, wenn die neue Information präziser, aktueller oder korrigierend ist; vermeide Duplikate (bei hoher Ähnlichkeit bevorzuge UPDATE statt ADD). "
+        "Verwende für UPDATE/DELETE ausschließlich die bereitgestellten bestehenden ids; bei ADD darf eine neue id erzeugt werden. "
+        "Jeder Eintrag enthält ein knappes Feld text (eine klare Ein‑Satz‑Formulierung). Erzeuge höchstens 5 Aktionen; wenn nichts qualifiziert, liefere eine leere Liste. "
+        "Antworte ausschließlich im geforderten JSON‑Format; kein zusätzlicher Text, keine Codeblöcke. "
+        "Liefere keine \"NONE\"‑Einträge, wenn insgesamt nichts zu tun ist – dann {\\\"memory\\\":[]} zurückgeben."
+    ),
 }
 
 
@@ -76,6 +100,15 @@ class MemoryCreate(BaseModel):
     agent_id: Optional[str] = None
     run_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    # Optional flags to influence extraction behavior
+    infer: Optional[bool] = Field(
+        default=None,
+        description="Whether to use LLM for fact extraction. If None, server default is used.",
+    )
+    prompt: Optional[str] = Field(
+        default=None,
+        description="Optional custom prompt to use for memory creation.",
+    )
 
 
 class SearchRequest(BaseModel):
@@ -102,7 +135,9 @@ def add_memory(memory_create: MemoryCreate):
 
     params = {k: v for k, v in memory_create.model_dump().items() if v is not None and k != "messages"}
     try:
-        response = MEMORY_INSTANCE.add(messages=[m.model_dump() for m in memory_create.messages], **params)
+        response = MEMORY_INSTANCE.add(
+            messages=[m.model_dump() for m in memory_create.messages], **params
+        )
         return JSONResponse(content=response)
     except Exception as e:
         logging.exception("Error in add_memory:")  # This will log the full traceback
